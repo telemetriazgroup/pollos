@@ -13,7 +13,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY .streamlit/ .streamlit/
-COPY data_processor.py cargo_store.py app.py pollos_bebes.json pollos_carga.json ./
+COPY data_processor.py cargo_store.py service_export.py pdf_reports.py app.py pollos_bebes.json pollos_carga.json ./
 
 EXPOSE 9601
 

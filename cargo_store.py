@@ -24,8 +24,36 @@ def save_cargo(data: dict[str, dict[str, Any]], path: Path = CARGO_FILE) -> None
         json.dump(data, handle, ensure_ascii=False, indent=2)
 
 
+def _find_cargo_entry(
+    service: ServiceSummary,
+    cargo_data: dict[str, dict[str, Any]],
+) -> dict[str, Any] | None:
+    entry = cargo_data.get(service_storage_key(service))
+    if entry:
+        return entry
+
+    service_start = service.start.isoformat()
+    service_end = service.end.isoformat()
+
+    for key, value in cargo_data.items():
+        if not isinstance(value, dict):
+            continue
+        if value.get("servicio_id") == service.service_id:
+            return value
+        if value.get("inicio") == service_start and value.get("fin") == service_end:
+            return value
+        if isinstance(key, str) and "|" in key:
+            start_key, end_key = key.split("|", 1)
+            if start_key == service_start and end_key == service_end:
+                return value
+
+    return None
+
+
 def get_chicken_count(service: ServiceSummary, cargo_data: dict[str, dict[str, Any]]) -> int | None:
-    entry = cargo_data.get(service_storage_key(service), {})
+    entry = _find_cargo_entry(service, cargo_data)
+    if not entry:
+        return None
     value = entry.get("cantidad_pollos")
     if value is None:
         return None
@@ -36,7 +64,9 @@ def get_chicken_count(service: ServiceSummary, cargo_data: dict[str, dict[str, A
 
 
 def get_chicken_notes(service: ServiceSummary, cargo_data: dict[str, dict[str, Any]]) -> str:
-    entry = cargo_data.get(service_storage_key(service), {})
+    entry = _find_cargo_entry(service, cargo_data)
+    if not entry:
+        return ""
     return str(entry.get("notas") or "")
 
 

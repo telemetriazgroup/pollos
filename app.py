@@ -18,6 +18,14 @@ from cargo_store import (
     save_cargo,
     upsert_service_cargo,
 )
+from pdf_reports import (
+    build_comparison_analysis,
+    comparison_pdf_filename,
+    generate_comparison_pdf,
+    generate_service_pdf,
+    service_pdf_filename,
+)
+from service_export import build_services_export_dataframe, export_filename
 from data_processor import (
     CARGO_FIELDS,
     MIN_SERVICE_HOURS,
@@ -170,6 +178,8 @@ def sidebar_navigation(services, days) -> str:
             "Evolución por día",
             "Gráficos de temperatura",
             "Carga de pollos",
+            "Exportar servicios",
+            "Reportes PDF",
             "Zonas de carga",
             "CO₂ y ventilación",
             "Comparar servicios",
@@ -322,6 +332,7 @@ def day_navigator(days) -> date:
 
 def render_service_cards(services, day_services) -> ServiceSummary | None:
     labels = {service.service_id: service_label(service) for service in day_services}
+    cargo_data = load_cargo()
     if not day_services:
         st.info("No hay servicios registrados para este día.")
         return None
@@ -340,7 +351,7 @@ def render_service_cards(services, day_services) -> ServiceSummary | None:
             st.write(f"Retorno: {fmt(service.averages.get('return_air'))}")
             st.write(f"Zonas prom.: {fmt(cargo_average(service))}")
             st.write(f"CO₂: {fmt(service.averages.get('co2_reading'), suffix=' %')}")
-            pollos = get_chicken_count(service, load_cargo())
+            pollos = get_chicken_count(service, cargo_data)
             if pollos is not None:
                 st.write(f"Pollos: {pollos:,}")
             if st.button("Ver detalle", key=f"pick_{service.service_id}"):
@@ -354,9 +365,11 @@ def render_service_detail_panel(service) -> None:
     st.markdown("---")
     st.subheader(service_label(service))
 
+    cargo_data = load_cargo()
+
     c1, c2, c3, c4, c5, c6, c7 = st.columns(7)
     c1.metric("Duración", f"{service.duration_hours:.1f} h")
-    pollos = get_chicken_count(service, load_cargo())
+    pollos = get_chicken_count(service, cargo_data)
     c2.metric("Pollos transportados", f"{pollos:,}" if pollos is not None else "—")
     c3.metric("Set point", fmt(service.averages.get("set_point")))
     c4.metric("Suministro", fmt(service.averages.get("temp_supply_1")))
@@ -369,6 +382,14 @@ def render_service_detail_panel(service) -> None:
         zone_cols[index].metric(label_for(field), fmt(service.averages.get(field)))
 
     tab_temps, tab_co2, tab_stats = st.tabs(["Curvas de temperatura", "CO₂ y ventilación", "Estadísticas"])
+
+    service_pdf = generate_service_pdf(service, load_cargo(), service_label(service))
+    st.download_button(
+        "Descargar reporte PDF del servicio",
+        data=service_pdf,
+        file_name=service_pdf_filename(service.service_id),
+        mime="application/pdf",
+    )
 
     with tab_temps:
         traces = []
@@ -989,6 +1010,192 @@ def render_cargo_table(services) -> None:
         st.rerun()
 
 
+def render_service_export(services) -> None:
+    st.subheader("Exportar promedios por servicio")
+    st.caption(
+        "Seleccione uno o varios servicios y descargue un archivo CSV con los promedios de "
+        "temperaturas, gases y la cantidad de pollitos registrada."
+    )
+
+    cargo_data = load_cargo()
+    labels = {service.service_id: service_label(service) for service in services}
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        date_from = st.date_input(
+            "Desde",
+            value=services[0].start.date(),
+            min_value=services[0].start.date(),
+            max_value=services[-1].end.date(),
+        )
+    with c2:
+        date_to = st.date_input(
+            "Hasta",
+            value=services[-1].end.date(),
+            min_value=services[0].start.date(),
+            max_value=services[-1].end.date(),
+        )
+    with c3:
+        only_with_chickens = st.checkbox("Solo servicios con cantidad de pollos", value=False)
+
+    filtered_services = [
+        service
+        for service in services
+        if service.start.date() <= date_to and service.end.date() >= date_from
+    ]
+    if only_with_chickens:
+        filtered_services = [
+            service for service in filtered_services if get_chicken_count(service, cargo_data) is not None
+        ]
+
+    if not filtered_services:
+        st.warning("No hay servicios en el rango seleccionado.")
+        return
+
+    filtered_ids = [service.service_id for service in filtered_services]
+    default_selection = filtered_ids[-min(5, len(filtered_ids)) :]
+
+    if "export_service_picker" in st.session_state:
+        st.session_state.export_service_picker = [
+            service_id
+            for service_id in st.session_state.export_service_picker
+            if service_id in filtered_ids
+        ]
+
+    stored_selection = st.session_state.get("export_service_ids", default_selection)
+    valid_selection = [service_id for service_id in stored_selection if service_id in filtered_ids]
+    if not valid_selection:
+        valid_selection = default_selection
+    st.session_state.export_service_ids = valid_selection
+
+    btn1, btn2, btn3 = st.columns(3)
+    if btn1.button("Seleccionar todos del filtro"):
+        st.session_state.export_service_ids = filtered_ids
+        st.session_state.export_service_picker = filtered_ids
+    if btn2.button("Limpiar selección"):
+        st.session_state.export_service_ids = []
+        st.session_state.export_service_picker = []
+    btn3.caption(f"{len(filtered_services)} servicios disponibles en el filtro")
+
+    selected_ids = st.multiselect(
+        "Servicios a exportar",
+        options=filtered_ids,
+        default=st.session_state.export_service_ids,
+        format_func=lambda sid: labels[sid],
+        key="export_service_picker",
+    )
+    st.session_state.export_service_ids = selected_ids
+
+    if not selected_ids:
+        st.info("Seleccione al menos un servicio para generar el reporte.")
+        return
+
+    export_df = build_services_export_dataframe(services, selected_ids, cargo_data)
+
+    st.markdown(f"**{len(export_df)} servicio(s)** listos para exportar")
+    st.dataframe(export_df, use_container_width=True, hide_index=True)
+
+    csv_data = export_df.to_csv(index=False).encode("utf-8-sig")
+    st.download_button(
+        label="Descargar CSV de promedios",
+        data=csv_data,
+        file_name=export_filename(),
+        mime="text/csv",
+        type="primary",
+    )
+
+    with_chickens = export_df["Cantidad pollos"].notna().sum()
+    st.caption(
+        f"Incluye temperaturas, CO₂, O₂, humedad, ventilación y compresor. "
+        f"Cantidad de pollos registrada en {with_chickens} de {len(export_df)} filas exportadas."
+    )
+
+
+def render_pdf_reports(services) -> None:
+    st.subheader("Reportes PDF")
+    st.caption(
+        "Genere reportes en PDF de un servicio individual o de la comparacion entre dos servicios "
+        "con analisis de diferencias significativas."
+    )
+
+    cargo_data = load_cargo()
+    labels = {service.service_id: service_label(service) for service in services}
+    tab_service, tab_compare = st.tabs(["Reporte de servicio", "Comparacion entre servicios"])
+
+    with tab_service:
+        service_id = st.selectbox(
+            "Servicio",
+            options=[service.service_id for service in services],
+            format_func=lambda sid: labels[sid],
+            index=len(services) - 1,
+            key="pdf_service_pick",
+        )
+        service = next(item for item in services if item.service_id == service_id)
+        pollos = get_chicken_count(service, cargo_data)
+
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Duracion", f"{service.duration_hours:.1f} h")
+        c2.metric("Lecturas", service.valid_count)
+        c3.metric("Pollos", f"{pollos:,}" if pollos is not None else "Sin registrar")
+
+        st.markdown(
+            "El PDF incluye promedios, medianas, minimos y maximos de temperaturas, gases, "
+            "ventilacion y cantidad de pollitos."
+        )
+        pdf_bytes = generate_service_pdf(service, load_cargo(), labels[service_id])
+        st.download_button(
+            "Descargar PDF del servicio",
+            data=pdf_bytes,
+            file_name=service_pdf_filename(service_id),
+            mime="application/pdf",
+            type="primary",
+            key="pdf_download_service",
+        )
+
+    with tab_compare:
+        c1, c2 = st.columns(2)
+        base_id = c1.selectbox(
+            "Servicio base",
+            options=[service.service_id for service in services],
+            format_func=lambda sid: labels[sid],
+            index=max(len(services) - 2, 0),
+            key="pdf_compare_base",
+        )
+        compare_options = [service.service_id for service in services if service.service_id != base_id]
+        compare_id = c2.selectbox(
+            "Servicio comparado",
+            options=compare_options,
+            format_func=lambda sid: labels[sid],
+            index=max(len(compare_options) - 1, 0),
+            key="pdf_compare_other",
+        )
+
+        base = next(item for item in services if item.service_id == base_id)
+        other = next(item for item in services if item.service_id == compare_id)
+        rows = compare_services(base, other)
+        analysis = build_comparison_analysis(base, other, rows)
+
+        st.markdown("#### Analisis de diferencias")
+        for line in analysis:
+            st.write(line)
+
+        comparison_pdf = generate_comparison_pdf(
+            base,
+            other,
+            load_cargo(),
+            labels[base_id],
+            labels[compare_id],
+        )
+        st.download_button(
+            "Descargar PDF comparativo",
+            data=comparison_pdf,
+            file_name=comparison_pdf_filename(base_id, compare_id),
+            mime="application/pdf",
+            type="primary",
+            key="pdf_download_compare",
+        )
+
+
 def render_zones(services) -> None:
     st.subheader("Temperaturas por zona de carga (pollitos)")
     st.caption("Las zonas 1 a 4 representan el ambiente donde viajan los pollitos.")
@@ -1176,6 +1383,27 @@ def render_comparison(services) -> None:
         fig.update_layout(height=460)
         st.plotly_chart(fig, use_container_width=True)
 
+    analysis = build_comparison_analysis(base, other, rows)
+    st.markdown("#### Análisis de diferencias")
+    for line in analysis:
+        st.write(line)
+
+    comparison_pdf = generate_comparison_pdf(
+        base,
+        other,
+        load_cargo(),
+        labels[base_id],
+        labels[compare_id],
+    )
+    st.download_button(
+        "Descargar reporte PDF comparativo",
+        data=comparison_pdf,
+        file_name=comparison_pdf_filename(base_id, compare_id),
+        mime="application/pdf",
+        type="primary",
+        key="comparison_page_pdf",
+    )
+
 
 def render_quality(stats) -> None:
     st.subheader("Calidad y limpieza de datos")
@@ -1238,6 +1466,10 @@ def main() -> None:
         render_temperature_charts(services, days)
     elif page == "Carga de pollos":
         render_cargo_table(services)
+    elif page == "Exportar servicios":
+        render_service_export(services)
+    elif page == "Reportes PDF":
+        render_pdf_reports(services)
     elif page == "Zonas de carga":
         render_zones(services)
     elif page == "CO₂ y ventilación":
